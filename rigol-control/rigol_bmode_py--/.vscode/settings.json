@@ -1,0 +1,6 @@
+{
+    "kiroAgent.configureMCP": "Disabled",
+    "terminal.integrated.tabs.location": "right",
+    "terminal.integrated.defaultLocation": "view",
+    "workbench.activityBar.location": "bottom"
+}
