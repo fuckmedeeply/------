@@ -77,9 +77,10 @@ function AcousticScanUI_Ultimate
     hwGrid.ColumnWidth = {110, '1x'};
     hwGrid.Padding = [15 10 15 15];
 
-    app.edS   = createInputRowWithLabel(hwGrid, 1, '灵敏度', 'V/MPa', 0.0263, 0.001, 1);
-    app.edG   = createInputRowWithLabel(hwGrid, 2, '增益', 'dB', 14, 0, 80);
-    app.edAtt = createInputRowWithLabel(hwGrid, 3, '衰减', 'dB', 18, 0, 80);
+    % 使用包含硬件增益和真实衰减的系统级灵敏度 (0.256)
+    app.edS   = createInputRowWithLabel(hwGrid, 1, '灵敏度', 'V/MPa', 0.256, 0.001, 5);
+    app.edG   = createInputRowWithLabel(hwGrid, 2, '增益', 'dB', 0, 0, 80);
+    app.edAtt = createInputRowWithLabel(hwGrid, 3, '衰减', 'dB', 0, 0, 80);
     % PRF 用文本框，允许初始显示 NaN；计算时再转成数值并校验
     lblPRF = uilabel(hwGrid, 'Text', '* PRF (必填) (Hz):', ...
         'HorizontalAlignment', 'left', 'FontWeight', 'bold');
@@ -192,7 +193,7 @@ function AcousticScanUI_Ultimate
     app.isCalculating = false;
     app.isCancelled = false;
 
-    app.defaultValues = struct('S', 0.0263, 'G', 14, 'Att', 18, ...
+    app.defaultValues = struct('S', 0.256, 'G', 0, 'Att', 0, ...
         'rho', 1000, 'c', 1500, 'PRF', NaN, 'maxBy', 'Vpp', 'useDynamicS', true);
 
     % ============================================================
@@ -1032,11 +1033,13 @@ function [result, rm, bestWave, maps, repStr, acst] = analyzeEngine(dataFolder, 
     Att = params.Att;
     Zac = params.rho * params.c;
 
+   % 补齐 0.5MHz 的数据，灵敏度沿用 1MHz 的 2.896，防止低频外推失真
     curve_F = [0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, ...
                11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0];
-    curve_S = [0.0214, 0.0243, 0.0263, 0.0260, 0.0265, 0.0247, 0.0224, ...
-               0.0207, 0.0192, 0.0181, 0.0170, 0.0151, 0.0132, 0.0117, ...
-               0.0138, 0.0151, 0.0166, 0.0203, 0.0221, 0.0233, 0.0245];
+               
+    % 替换为 Measured Sensitivity (带-20dB衰减器 + 14dB前放的系统真实输出)
+    curve_S = [0.256, 0.256, 0.227, 0.250, 0.248, 0.255, 0.256, 0.253, 0.256, 0.252, 0.244, ...
+               0.233, 0.216, 0.199, 0.174, 0.150, 0.127, 0.107, 0.089, 0.074, 0.067];
 
     files = dir(fullfile(dataFolder, '*.xlsx'));
     files = files(~contains(string({files.name}), ["Result","Report","Ispta"]));
@@ -1099,17 +1102,31 @@ function [result, rm, bestWave, maps, repStr, acst] = analyzeEngine(dataFolder, 
             dt = abs(t(2)-t(1));
             v_ac = v - mean(v);
 
-            % =========================================================
-            % 【新增】Time Gate 安全窗口：自动剔除边缘截断毛刺
-            % 将波形开头和结尾各 2% 的数据强制归零，防止边缘突变污染峰值和脉宽判定
+           % =========================================================
+            % 【修改】平滑渐变窗口法（Tukey Window）：消除边缘截断毛刺
+            % 采用余弦锥度窗，使波形首尾平滑渐变衰减到 0，中间 90% 保持完全无损。
+            % 既能屏蔽示波器边缘毛刺，又能保护 FFT 频谱不产生高频截断假象。
             % =========================================================
             L_pts = numel(v_ac);
-            % 计算需要剔除的边缘点数（2%，并保证至少剔除 5 个点）
-            gate_margin = max(5, round(0.02 * L_pts)); 
+            taper_ratio = 0.1; % 衰减比例：0.1 代表首尾各平滑衰减 5%
             
-            % 将首尾存在隐患的数据区段置零（背景噪声也一并归零，不影响核心波形）
-            v_ac(1 : gate_margin) = 0;
-            v_ac(end - gate_margin + 1 : end) = 0;
+            try
+                % 优先尝试调用信号处理工具箱的 tukeywin 函数
+                win = tukeywin(L_pts, taper_ratio);
+            catch
+                % Fallback: 如果没有安装信号处理工具箱，手动生成等效的 Tukey 窗
+                win = ones(L_pts, 1);
+                taper_pts = floor((taper_ratio / 2) * L_pts);
+                if taper_pts > 0
+                    % 生成前半段的上升余弦曲线
+                    win(1:taper_pts) = 0.5 * (1 - cos(pi * (0:taper_pts-1)' / taper_pts));
+                    % 生成后半段的下降余弦曲线
+                    win(end-taper_pts+1:end) = 0.5 * (1 - cos(pi * (taper_pts-1:-1:0)' / taper_pts));
+                end
+            end
+            
+            % 将原始波形乘以平滑窗口
+            v_ac = v_ac .* win;
             % =========================================================
 
             L = numel(v_ac);
@@ -1251,6 +1268,12 @@ function [result, rm, bestWave, maps, repStr, acst] = analyzeEngine(dataFolder, 
     result = table(fnames, X_l, Y_l, Z_l, Fc_l, Vpp_l, Vrms_l, Ppp_l, Prms_l, PII_l, Isppa_l, Ispta_l, Isptp_l, Pneg_l, Tau_l, ...
         'VariableNames',{'File','X','Y','Z','Fc','Vpp','Vrms','Ppp','Prms','PII','Isppa','Ispta','Isptp','Pneg','Tau'});
 
+    % === 新增的 3 行代码开始：消除浮点数抖动 ===
+    result.X = round(result.X, 3);
+    result.Y = round(result.Y, 3);
+    result.Z = round(result.Z, 3);
+    % === 新增的 3 行代码结束 ===
+
     if strcmpi(params.maxBy, 'Vpp')
         [~, imax] = max(result.Vpp);
     elseif strcmpi(params.maxBy, 'PII')
@@ -1334,6 +1357,7 @@ function [result, rm, bestWave, maps, repStr, acst] = analyzeEngine(dataFolder, 
     lines(end+1) = sprintf("成功文件数 : %d", numel(fnames));
     lines(end+1) = sprintf("失败文件数 : %d", numel(failedFiles));
     lines(end+1) = sprintf("Vpp : %.4f V   | Ppp : %.4f MPa", rm.Vpp, rm.Ppp);
+    lines(end+1) = sprintf("最大负压 (Pneg): %.4f MPa", rm.Pneg);  % <--- 这是新增的一行
     lines(end+1) = sprintf("Fc  : %.2f MHz | Tau : %.2f us", rm.Fc, rm.Tau);
     if maps.is2D || maps.is3D
         lines(end+1) = "------------------------------";
@@ -1506,8 +1530,8 @@ function acst = calculateAcousticParams(acst, maps, rm, params, dx, dy)
     acst.Isppa = rm.Isppa / 10;
     acst.Isptp = rm.Isptp / 10;
 
-    mask_power = maps.Mat_pii >= pii_max * 10^(-20/10);
-    W = sum(maps.Mat_pta(mask_power), 'omitnan') * (dx * dy * 1e-6);
+    % 严格按照标准：对整个扫描 S 平面内所有的栅格声强求和（无 -20dB 截断）
+    W = sum(maps.Mat_pta(:), 'omitnan') * (dx * dy * 1e-6);
     acst.Power_mW = W * 1000;
 
     z_cm = rm.Z / 10;
